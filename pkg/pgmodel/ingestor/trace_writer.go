@@ -31,9 +31,7 @@ const (
 )
 
 type traceWriter interface {
-	InsertInstrumentationLibSpans(ctx context.Context, instLibSpans pdata.InstrumentationLibrarySpansSlice, serviceName string, rSchemaURLID pgtype.Int8, resourceTags pdata.AttributeMap) error
-	InsertSchemaURL(ctx context.Context, sURL string) (id pgtype.Int8, err error)
-	InsertInstrumentationLibrary(ctx context.Context, name, version, sURL string) (id pgtype.Int8, err error)
+	InsertTraces(ctx context.Context, traces pdata.Traces) error
 }
 
 type traceWriterImpl struct {
@@ -44,38 +42,6 @@ func newTraceWriter(conn pgxconn.PgxConn) *traceWriterImpl {
 	return &traceWriterImpl{
 		conn: conn,
 	}
-}
-
-func (t *traceWriterImpl) InsertSchemaURL(ctx context.Context, sURL string) (id pgtype.Int8, err error) {
-	if sURL == "" {
-		id.Status = pgtype.Null
-		return id, nil
-	}
-	err = t.conn.QueryRow(ctx, fmt.Sprintf(insertSchemaURLSQL, schema.TracePublic), sURL).Scan(&id)
-	return id, err
-}
-
-func (t *traceWriterImpl) InsertInstrumentationLibrary(ctx context.Context, name, version, schemaURL string) (id pgtype.Int8, err error) {
-	if name == "" || version == "" {
-		id.Status = pgtype.Null
-		return id, nil
-	}
-	var sID pgtype.Int8
-	if schemaURL != "" {
-		schemaURLID, err := t.InsertSchemaURL(ctx, schemaURL)
-		if err != nil {
-			return id, err
-		}
-		err = sID.Set(schemaURLID)
-		if err != nil {
-			return id, err
-		}
-	} else {
-		sID.Status = pgtype.Null
-	}
-
-	err = t.conn.QueryRow(ctx, fmt.Sprintf(insertInstrumentationLibSQL, schema.TracePublic), name, version, sID).Scan(&id)
-	return id, err
 }
 
 func (t *traceWriterImpl) queueSpanLinks(linkBatch pgxconn.PgxBatch, tagBatch TagBatch, links pdata.SpanLinkSlice, traceID [16]byte, spanID [8]byte, spanStartTime time.Time) error {
@@ -136,27 +102,40 @@ func (t *traceWriterImpl) queueSpanEvents(eventBatch pgxconn.PgxBatch, tagBatch 
 	return nil
 }
 
-func (t *traceWriterImpl) InsertInstrumentationLibSpans(ctx context.Context, instLibSpans pdata.InstrumentationLibrarySpansSlice, serviceName string, rSchemaURLID pgtype.Int8, resourceTags pdata.AttributeMap) error {
+func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces) error {
+	rSpans := traces.ResourceSpans()
+
 	sURLBatch := NewSchemaUrlBatch()
-	for j := 0; j < instLibSpans.Len(); j++ {
-		instLibSpan := instLibSpans.At(j)
-		url := instLibSpan.SchemaUrl()
+	for i := 0; i < rSpans.Len(); i++ {
+		rSpan := rSpans.At(i)
+		url := rSpan.SchemaUrl()
 		sURLBatch.Queue(url)
+
+		instLibSpans := rSpan.InstrumentationLibrarySpans()
+		for j := 0; j < instLibSpans.Len(); j++ {
+			instLibSpan := instLibSpans.At(j)
+			url := instLibSpan.SchemaUrl()
+			sURLBatch.Queue(url)
+		}
 	}
 	if err := sURLBatch.SendBatch(ctx, t.conn); err != nil {
 		return err
 	}
 
 	instrLibBatch := NewInstrumentationLibraryBatch()
-	for j := 0; j < instLibSpans.Len(); j++ {
-		instLibSpan := instLibSpans.At(j)
-		instLib := instLibSpan.InstrumentationLibrary()
+	for i := 0; i < rSpans.Len(); i++ {
+		rSpan := rSpans.At(i)
+		instLibSpans := rSpan.InstrumentationLibrarySpans()
+		for j := 0; j < instLibSpans.Len(); j++ {
+			instLibSpan := instLibSpans.At(j)
+			instLib := instLibSpan.InstrumentationLibrary()
 
-		sURLID, err := sURLBatch.GetID(instLibSpan.SchemaUrl())
-		if err != nil {
-			return err
+			sURLID, err := sURLBatch.GetID(instLibSpan.SchemaUrl())
+			if err != nil {
+				return err
+			}
+			instrLibBatch.Queue(instLib.Name(), instLib.Version(), sURLID)
 		}
-		instrLibBatch.Queue(instLib.Name(), instLib.Version(), sURLID)
 	}
 	if err := instrLibBatch.SendBatch(ctx, t.conn); err != nil {
 		return err
@@ -168,80 +147,96 @@ func (t *traceWriterImpl) InsertInstrumentationLibSpans(ctx context.Context, ins
 	tagBatch := NewTagBatch()
 	operationBatch := NewOperationBatch()
 
-	for j := 0; j < instLibSpans.Len(); j++ {
-		instLibSpan := instLibSpans.At(j)
-		instLib := instLibSpan.InstrumentationLibrary()
+	for i := 0; i < rSpans.Len(); i++ {
+		rSpan := rSpans.At(i)
+		instLibSpans := rSpan.InstrumentationLibrarySpans()
 
-		sURLID, err := sURLBatch.GetID(instLibSpan.SchemaUrl())
+		serviceName := missingServiceName
+		av, found := rSpan.Resource().Attributes().Get(serviceNameTagKey)
+		if found {
+			serviceName = av.AsString()
+		}
+
+		url := rSpan.SchemaUrl()
+		rSchemaURLID, err := sURLBatch.GetID(url)
 		if err != nil {
 			return err
 		}
-		instLibID, err := instrLibBatch.GetID(
-			instLib.Name(), instLib.Version(), sURLID)
-		if err != nil {
-			return err
-		}
+		for j := 0; j < instLibSpans.Len(); j++ {
+			instLibSpan := instLibSpans.At(j)
+			instLib := instLibSpan.InstrumentationLibrary()
 
-		spans := instLibSpan.Spans()
-		for k := 0; k < spans.Len(); k++ {
-			span := spans.At(k)
-			traceID := span.TraceID().Bytes()
-			spanID := span.SpanID().Bytes()
-			spanName := span.Name()
-			spanKind := span.Kind().String()
-
-			operationBatch.Queue(Operation{serviceName, spanName, spanKind})
-
-			if err := t.queueSpanEvents(eventBatch, tagBatch, span.Events(), traceID, spanID); err != nil {
-				return err
-			}
-			if err := t.queueSpanLinks(linkBatch, tagBatch, span.Links(), traceID, spanID, span.StartTimestamp().AsTime()); err != nil {
-				return err
-			}
-			spanIDInt := ByteArrayToInt64(spanID)
-			parentSpanIDInt := ByteArrayToInt64(span.ParentSpanID().Bytes())
-			rawResourceTags := resourceTags.AsRaw()
-			if err := tagBatch.Queue(rawResourceTags, ResourceTagType); err != nil {
-				return err
-			}
-			jsonResourceTags, err := json.Marshal(rawResourceTags)
+			sURLID, err := sURLBatch.GetID(instLibSpan.SchemaUrl())
 			if err != nil {
 				return err
 			}
-			rawTags := span.Attributes().AsRaw()
-			if err := tagBatch.Queue(rawTags, SpanTagType); err != nil {
-				return err
-			}
-			jsonTags, err := json.Marshal(rawTags)
+			instLibID, err := instrLibBatch.GetID(
+				instLib.Name(), instLib.Version(), sURLID)
 			if err != nil {
 				return err
 			}
 
-			eventTimeRange := getEventTimeRange(span.Events())
+			spans := instLibSpan.Spans()
+			for k := 0; k < spans.Len(); k++ {
+				span := spans.At(k)
+				traceID := span.TraceID().Bytes()
+				spanID := span.SpanID().Bytes()
+				spanName := span.Name()
+				spanKind := span.Kind().String()
 
-			spanBatch.Queue(
-				fmt.Sprintf(insertSpanSQL, schema.Trace, schema.TracePublic, schema.TracePublic, schema.TracePublic),
-				TraceIDToUUID(traceID),
-				spanIDInt,
-				getTraceStateValue(span.TraceState()),
-				parentSpanIDInt,
-				serviceName,
-				spanName,
-				spanKind,
-				span.StartTimestamp().AsTime(),
-				span.EndTimestamp().AsTime(),
-				string(jsonTags),
-				span.DroppedAttributesCount(),
-				eventTimeRange,
-				span.DroppedEventsCount(),
-				span.DroppedLinksCount(),
-				span.Status().Code().String(),
-				span.Status().Message(),
-				instLibID,
-				string(jsonResourceTags),
-				0, // TODO: Add resource_dropped_tags_count when it gets exposed upstream.
-				rSchemaURLID,
-			)
+				operationBatch.Queue(Operation{serviceName, spanName, spanKind})
+
+				if err := t.queueSpanEvents(eventBatch, tagBatch, span.Events(), traceID, spanID); err != nil {
+					return err
+				}
+				if err := t.queueSpanLinks(linkBatch, tagBatch, span.Links(), traceID, spanID, span.StartTimestamp().AsTime()); err != nil {
+					return err
+				}
+				spanIDInt := ByteArrayToInt64(spanID)
+				parentSpanIDInt := ByteArrayToInt64(span.ParentSpanID().Bytes())
+				rawResourceTags := rSpan.Resource().Attributes().AsRaw()
+				if err := tagBatch.Queue(rawResourceTags, ResourceTagType); err != nil {
+					return err
+				}
+				jsonResourceTags, err := json.Marshal(rawResourceTags)
+				if err != nil {
+					return err
+				}
+				rawTags := span.Attributes().AsRaw()
+				if err := tagBatch.Queue(rawTags, SpanTagType); err != nil {
+					return err
+				}
+				jsonTags, err := json.Marshal(rawTags)
+				if err != nil {
+					return err
+				}
+
+				eventTimeRange := getEventTimeRange(span.Events())
+
+				spanBatch.Queue(
+					fmt.Sprintf(insertSpanSQL, schema.Trace, schema.TracePublic, schema.TracePublic, schema.TracePublic),
+					TraceIDToUUID(traceID),
+					spanIDInt,
+					getTraceStateValue(span.TraceState()),
+					parentSpanIDInt,
+					serviceName,
+					spanName,
+					spanKind,
+					span.StartTimestamp().AsTime(),
+					span.EndTimestamp().AsTime(),
+					string(jsonTags),
+					span.DroppedAttributesCount(),
+					eventTimeRange,
+					span.DroppedEventsCount(),
+					span.DroppedLinksCount(),
+					span.Status().Code().String(),
+					span.Status().Message(),
+					instLibID,
+					string(jsonResourceTags),
+					0, // TODO: Add resource_dropped_tags_count when it gets exposed upstream.
+					rSchemaURLID,
+				)
+			}
 		}
 	}
 
