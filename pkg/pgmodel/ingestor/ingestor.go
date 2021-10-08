@@ -95,17 +95,9 @@ func (ingestor *DBIngestor) IngestTraces(ctx context.Context, r pdata.Traces) er
 		}
 
 		instLibSpans := rSpan.InstrumentationLibrarySpans()
-		for j := 0; j < instLibSpans.Len(); j++ {
-			instLibSpan := instLibSpans.At(j)
-			instLib := instLibSpan.InstrumentationLibrary()
-			instLibID, err := ingestor.tWriter.InsertInstrumentationLibrary(ctx, instLib.Name(), instLib.Version(), instLibSpan.SchemaUrl())
-			if err != nil {
-				return err
-			}
-
-			if err = ingestor.tWriter.InsertSpans(ctx, instLibSpan.Spans(), serviceName, instLibID, rSchemaURLID, rSpan.Resource().Attributes()); err != nil {
-				return err
-			}
+		err = ingestor.tWriter.InsertInstrumentationLibSpans(ctx, instLibSpans, serviceName, rSchemaURLID, rSpan.Resource().Attributes())
+		if err != nil {
+			return err
 		}
 	}
 

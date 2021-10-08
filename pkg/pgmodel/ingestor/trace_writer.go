@@ -31,7 +31,7 @@ const (
 )
 
 type traceWriter interface {
-	InsertSpans(ctx context.Context, spans pdata.SpanSlice, serviceName string, instLibID, rSchemaURLID pgtype.Int8, resourceTags pdata.AttributeMap) error
+	InsertInstrumentationLibSpans(ctx context.Context, instLibSpans pdata.InstrumentationLibrarySpansSlice, serviceName string, rSchemaURLID pgtype.Int8, resourceTags pdata.AttributeMap) error
 	InsertSchemaURL(ctx context.Context, sURL string) (id pgtype.Int8, err error)
 	InsertInstrumentationLibrary(ctx context.Context, name, version, sURL string) (id pgtype.Int8, err error)
 }
@@ -136,71 +136,113 @@ func (t *traceWriterImpl) queueSpanEvents(eventBatch pgxconn.PgxBatch, tagBatch 
 	return nil
 }
 
-func (t *traceWriterImpl) InsertSpans(ctx context.Context, spans pdata.SpanSlice, serviceName string, instLibID, rSchemaURLID pgtype.Int8, resourceTags pdata.AttributeMap) error {
+func (t *traceWriterImpl) InsertInstrumentationLibSpans(ctx context.Context, instLibSpans pdata.InstrumentationLibrarySpansSlice, serviceName string, rSchemaURLID pgtype.Int8, resourceTags pdata.AttributeMap) error {
+	sURLBatch := NewSchemaUrlBatch()
+	for j := 0; j < instLibSpans.Len(); j++ {
+		instLibSpan := instLibSpans.At(j)
+		url := instLibSpan.SchemaUrl()
+		sURLBatch.Queue(url)
+	}
+	if err := sURLBatch.SendBatch(ctx, t.conn); err != nil {
+		return err
+	}
+
+	instrLibBatch := NewInstrumentationLibraryBatch()
+	for j := 0; j < instLibSpans.Len(); j++ {
+		instLibSpan := instLibSpans.At(j)
+		instLib := instLibSpan.InstrumentationLibrary()
+
+		sURLID, err := sURLBatch.GetID(instLibSpan.SchemaUrl())
+		if err != nil {
+			return err
+		}
+		instrLibBatch.Queue(instLib.Name(), instLib.Version(), sURLID)
+	}
+	if err := instrLibBatch.SendBatch(ctx, t.conn); err != nil {
+		return err
+	}
+
 	spanBatch := t.conn.NewBatch()
 	linkBatch := t.conn.NewBatch()
 	eventBatch := t.conn.NewBatch()
 	tagBatch := NewTagBatch()
 	operationBatch := NewOperationBatch()
-	for k := 0; k < spans.Len(); k++ {
-		span := spans.At(k)
-		traceID := span.TraceID().Bytes()
-		spanID := span.SpanID().Bytes()
-		spanName := span.Name()
-		spanKind := span.Kind().String()
 
-		operationBatch.Queue(Operation{serviceName, spanName, spanKind})
+	for j := 0; j < instLibSpans.Len(); j++ {
+		instLibSpan := instLibSpans.At(j)
+		instLib := instLibSpan.InstrumentationLibrary()
 
-		if err := t.queueSpanEvents(eventBatch, tagBatch, span.Events(), traceID, spanID); err != nil {
-			return err
-		}
-		if err := t.queueSpanLinks(linkBatch, tagBatch, span.Links(), traceID, spanID, span.StartTimestamp().AsTime()); err != nil {
-			return err
-		}
-		spanIDInt := ByteArrayToInt64(spanID)
-		parentSpanIDInt := ByteArrayToInt64(span.ParentSpanID().Bytes())
-		rawResourceTags := resourceTags.AsRaw()
-		if err := tagBatch.Queue(rawResourceTags, ResourceTagType); err != nil {
-			return err
-		}
-		jsonResourceTags, err := json.Marshal(rawResourceTags)
+		sURLID, err := sURLBatch.GetID(instLibSpan.SchemaUrl())
 		if err != nil {
 			return err
 		}
-		rawTags := span.Attributes().AsRaw()
-		if err := tagBatch.Queue(rawTags, SpanTagType); err != nil {
-			return err
-		}
-		jsonTags, err := json.Marshal(rawTags)
+		instLibID, err := instrLibBatch.GetID(
+			instLib.Name(), instLib.Version(), sURLID)
 		if err != nil {
 			return err
 		}
 
-		eventTimeRange := getEventTimeRange(span.Events())
+		spans := instLibSpan.Spans()
+		for k := 0; k < spans.Len(); k++ {
+			span := spans.At(k)
+			traceID := span.TraceID().Bytes()
+			spanID := span.SpanID().Bytes()
+			spanName := span.Name()
+			spanKind := span.Kind().String()
 
-		spanBatch.Queue(
-			fmt.Sprintf(insertSpanSQL, schema.Trace, schema.TracePublic, schema.TracePublic, schema.TracePublic),
-			TraceIDToUUID(traceID),
-			spanIDInt,
-			getTraceStateValue(span.TraceState()),
-			parentSpanIDInt,
-			serviceName,
-			spanName,
-			spanKind,
-			span.StartTimestamp().AsTime(),
-			span.EndTimestamp().AsTime(),
-			string(jsonTags),
-			span.DroppedAttributesCount(),
-			eventTimeRange,
-			span.DroppedEventsCount(),
-			span.DroppedLinksCount(),
-			span.Status().Code().String(),
-			span.Status().Message(),
-			instLibID,
-			string(jsonResourceTags),
-			0, // TODO: Add resource_dropped_tags_count when it gets exposed upstream.
-			rSchemaURLID,
-		)
+			operationBatch.Queue(Operation{serviceName, spanName, spanKind})
+
+			if err := t.queueSpanEvents(eventBatch, tagBatch, span.Events(), traceID, spanID); err != nil {
+				return err
+			}
+			if err := t.queueSpanLinks(linkBatch, tagBatch, span.Links(), traceID, spanID, span.StartTimestamp().AsTime()); err != nil {
+				return err
+			}
+			spanIDInt := ByteArrayToInt64(spanID)
+			parentSpanIDInt := ByteArrayToInt64(span.ParentSpanID().Bytes())
+			rawResourceTags := resourceTags.AsRaw()
+			if err := tagBatch.Queue(rawResourceTags, ResourceTagType); err != nil {
+				return err
+			}
+			jsonResourceTags, err := json.Marshal(rawResourceTags)
+			if err != nil {
+				return err
+			}
+			rawTags := span.Attributes().AsRaw()
+			if err := tagBatch.Queue(rawTags, SpanTagType); err != nil {
+				return err
+			}
+			jsonTags, err := json.Marshal(rawTags)
+			if err != nil {
+				return err
+			}
+
+			eventTimeRange := getEventTimeRange(span.Events())
+
+			spanBatch.Queue(
+				fmt.Sprintf(insertSpanSQL, schema.Trace, schema.TracePublic, schema.TracePublic, schema.TracePublic),
+				TraceIDToUUID(traceID),
+				spanIDInt,
+				getTraceStateValue(span.TraceState()),
+				parentSpanIDInt,
+				serviceName,
+				spanName,
+				spanKind,
+				span.StartTimestamp().AsTime(),
+				span.EndTimestamp().AsTime(),
+				string(jsonTags),
+				span.DroppedAttributesCount(),
+				eventTimeRange,
+				span.DroppedEventsCount(),
+				span.DroppedLinksCount(),
+				span.Status().Code().String(),
+				span.Status().Message(),
+				instLibID,
+				string(jsonResourceTags),
+				0, // TODO: Add resource_dropped_tags_count when it gets exposed upstream.
+				rSchemaURLID,
+			)
+		}
 	}
 
 	if err := operationBatch.SendBatch(ctx, t.conn); err != nil {
@@ -391,8 +433,140 @@ func (batch TagBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error
 		return err
 	}
 	if err = br.Close(); err != nil {
-		fmt.Println(err)
 		return err
 	}
 	return nil
+}
+
+type SchemaUrl string
+
+//TagBatch queues up items to send to the db but it sorts before sending
+//this avoids deadlocks in the db. It also avoids sending the same tags repeatedly.
+type SchemaUrlBatch map[SchemaUrl]int64
+
+func NewSchemaUrlBatch() SchemaUrlBatch {
+	return make(map[SchemaUrl]int64)
+}
+
+func (batch SchemaUrlBatch) Queue(url string) {
+	if url != "" {
+		batch[SchemaUrl(url)] = 0
+	}
+}
+
+func (batch SchemaUrlBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error {
+	urls := make([]SchemaUrl, len(batch))
+	i := 0
+	for url := range batch {
+		urls[i] = url
+		i++
+	}
+	sort.Slice(urls, func(i, j int) bool {
+		return urls[i] < urls[j]
+	})
+
+	dbBatch := conn.NewBatch()
+	for _, sURL := range urls {
+		dbBatch.Queue(fmt.Sprintf(insertSchemaURLSQL, schema.TracePublic), sURL)
+	}
+
+	br, err := conn.SendBatch(ctx, dbBatch)
+	if err != nil {
+		return err
+	}
+	for _, sURL := range urls {
+		var id int64
+		if err := br.QueryRow().Scan(&id); err != nil {
+			return err
+		}
+		batch[sURL] = id
+	}
+	if err = br.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (batch SchemaUrlBatch) GetID(url string) (pgtype.Int8, error) {
+	if url == "" {
+		return pgtype.Int8{Status: pgtype.Null}, nil
+	}
+	id, ok := batch[SchemaUrl(url)]
+	if id == 0 || !ok {
+		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("schema url id not found")
+	}
+	return pgtype.Int8{Int: id, Status: pgtype.Present}, nil
+}
+
+type InstrumentationLibrary struct {
+	name        string
+	version     string
+	SchemaUrlID pgtype.Int8
+}
+
+//TagBatch queues up items to send to the db but it sorts before sending
+//this avoids deadlocks in the db. It also avoids sending the same tags repeatedly.
+type InstrumentationLibraryBatch map[InstrumentationLibrary]int64
+
+func NewInstrumentationLibraryBatch() InstrumentationLibraryBatch {
+	return make(map[InstrumentationLibrary]int64)
+}
+
+func (batch InstrumentationLibraryBatch) Queue(name, version string, schemaUrlID pgtype.Int8) {
+	if name != "" {
+		batch[InstrumentationLibrary{name, version, schemaUrlID}] = 0
+	}
+}
+
+func (batch InstrumentationLibraryBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error {
+	libs := make([]InstrumentationLibrary, len(batch))
+	i := 0
+	for lib := range batch {
+		libs[i] = lib
+		i++
+	}
+	sort.Slice(libs, func(i, j int) bool {
+		if libs[i].name == libs[j].name {
+			if libs[i].version == libs[j].version {
+				if libs[i].SchemaUrlID.Status == libs[j].SchemaUrlID.Status {
+					return libs[i].SchemaUrlID.Int < libs[j].SchemaUrlID.Int
+				}
+				return libs[i].SchemaUrlID.Status < libs[j].SchemaUrlID.Status
+			}
+			return libs[i].version < libs[j].version
+		}
+		return libs[i].version < libs[j].version
+	})
+
+	dbBatch := conn.NewBatch()
+	for _, lib := range libs {
+		dbBatch.Queue(fmt.Sprintf(insertInstrumentationLibSQL, schema.TracePublic), lib.name, lib.version, lib.SchemaUrlID)
+	}
+
+	br, err := conn.SendBatch(ctx, dbBatch)
+	if err != nil {
+		return err
+	}
+	for _, lib := range libs {
+		var id int64
+		if err := br.QueryRow().Scan(&id); err != nil {
+			return err
+		}
+		batch[lib] = id
+	}
+	if err = br.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (batch InstrumentationLibraryBatch) GetID(name, version string, schemaUrlID pgtype.Int8) (pgtype.Int8, error) {
+	if name == "" {
+		return pgtype.Int8{Status: pgtype.Null}, nil
+	}
+	id, ok := batch[InstrumentationLibrary{name, version, schemaUrlID}]
+	if id == 0 || !ok {
+		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("instrumention library id not found: %s %s", name, version)
+	}
+	return pgtype.Int8{Int: id, Status: pgtype.Present}, nil
 }
