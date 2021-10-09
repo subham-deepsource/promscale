@@ -26,7 +26,7 @@ const (
 		VALUES ($1, $2, $3, $4, $5, %s.get_tag_map($6), $7)`
 	insertSpanSQL = `INSERT INTO %s.span (trace_id, span_id, trace_state, parent_span_id, operation_id, start_time, end_time, span_tags, dropped_tags_count,
 		event_time, dropped_events_count, dropped_link_count, status_code, status_message, instrumentation_lib_id, resource_tags, resource_dropped_tags_count, resource_schema_url_id)
-		VALUES ($1, $2, $3, $4, %s.get_operation($5, $6, $7), $8, $9, %s.get_tag_map($10), $11, $12, $13, $14, $15, $16, $17, %s.get_tag_map($18), $19, $20)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, %s.get_tag_map($8), $9, $10, $11, $12, $13, $14, $15, %s.get_tag_map($16), $17, $18)
 		ON CONFLICT DO NOTHING`  // Most cases conflict only happens on retries, safe to ignore duplicate data.
 )
 
@@ -102,6 +102,15 @@ func (t *traceWriterImpl) queueSpanEvents(eventBatch pgxconn.PgxBatch, tagBatch 
 	return nil
 }
 
+func getServiceName(rSpan pdata.ResourceSpans) string {
+	serviceName := missingServiceName
+	av, found := rSpan.Resource().Attributes().Get(serviceNameTagKey)
+	if found {
+		serviceName = av.AsString()
+	}
+	return serviceName
+}
+
 func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces) error {
 	rSpans := traces.ResourceSpans()
 
@@ -123,8 +132,10 @@ func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces)
 	}
 
 	instrLibBatch := NewInstrumentationLibraryBatch()
+	operationBatch := NewOperationBatch()
 	for i := 0; i < rSpans.Len(); i++ {
 		rSpan := rSpans.At(i)
+		serviceName := getServiceName(rSpan)
 		instLibSpans := rSpan.InstrumentationLibrarySpans()
 		for j := 0; j < instLibSpans.Len(); j++ {
 			instLibSpan := instLibSpans.At(j)
@@ -135,9 +146,21 @@ func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces)
 				return err
 			}
 			instrLibBatch.Queue(instLib.Name(), instLib.Version(), sURLID)
+
+			spans := instLibSpan.Spans()
+			for k := 0; k < spans.Len(); k++ {
+				span := spans.At(k)
+				spanName := span.Name()
+				spanKind := span.Kind().String()
+
+				operationBatch.Queue(serviceName, spanName, spanKind)
+			}
 		}
 	}
 	if err := instrLibBatch.SendBatch(ctx, t.conn); err != nil {
+		return err
+	}
+	if err := operationBatch.SendBatch(ctx, t.conn); err != nil {
 		return err
 	}
 
@@ -145,17 +168,10 @@ func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces)
 	linkBatch := t.conn.NewBatch()
 	eventBatch := t.conn.NewBatch()
 	tagBatch := NewTagBatch()
-	operationBatch := NewOperationBatch()
-
 	for i := 0; i < rSpans.Len(); i++ {
 		rSpan := rSpans.At(i)
 		instLibSpans := rSpan.InstrumentationLibrarySpans()
-
-		serviceName := missingServiceName
-		av, found := rSpan.Resource().Attributes().Get(serviceNameTagKey)
-		if found {
-			serviceName = av.AsString()
-		}
+		serviceName := getServiceName(rSpan)
 
 		url := rSpan.SchemaUrl()
 		rSchemaURLID, err := sURLBatch.GetID(url)
@@ -183,8 +199,10 @@ func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces)
 				spanID := span.SpanID().Bytes()
 				spanName := span.Name()
 				spanKind := span.Kind().String()
-
-				operationBatch.Queue(Operation{serviceName, spanName, spanKind})
+				operationID, err := operationBatch.GetID(serviceName, spanName, spanKind)
+				if err != nil {
+					return err
+				}
 
 				if err := t.queueSpanEvents(eventBatch, tagBatch, span.Events(), traceID, spanID); err != nil {
 					return err
@@ -214,14 +232,12 @@ func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces)
 				eventTimeRange := getEventTimeRange(span.Events())
 
 				spanBatch.Queue(
-					fmt.Sprintf(insertSpanSQL, schema.Trace, schema.TracePublic, schema.TracePublic, schema.TracePublic),
+					fmt.Sprintf(insertSpanSQL, schema.Trace, schema.TracePublic, schema.TracePublic),
 					TraceIDToUUID(traceID),
 					spanIDInt,
 					getTraceStateValue(span.TraceState()),
 					parentSpanIDInt,
-					serviceName,
-					spanName,
-					spanKind,
+					operationID,
 					span.StartTimestamp().AsTime(),
 					span.EndTimestamp().AsTime(),
 					string(jsonTags),
@@ -240,9 +256,6 @@ func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces)
 		}
 	}
 
-	if err := operationBatch.SendBatch(ctx, t.conn); err != nil {
-		return err
-	}
 	if err := tagBatch.SendBatch(ctx, t.conn); err != nil {
 		return err
 	}
@@ -329,14 +342,14 @@ type Operation struct {
 
 //Operation batch queues up items to send to the db but it sorts before sending
 //this avoids deadlocks in the db
-type OperationBatch map[Operation]struct{}
+type OperationBatch map[Operation]int64
 
 func NewOperationBatch() OperationBatch {
-	return make(map[Operation]struct{})
+	return make(map[Operation]int64)
 }
 
-func (o OperationBatch) Queue(op Operation) {
-	o[op] = struct{}{}
+func (o OperationBatch) Queue(serviceName, spanName, spanKind string) {
+	o[Operation{serviceName, spanName, spanKind}] = 0
 }
 
 func (batch OperationBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error {
@@ -360,15 +373,28 @@ func (batch OperationBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn)
 	for _, op := range ops {
 		dbBatch.Queue(fmt.Sprintf(insertOperationSQL, schema.TracePublic), op.serviceName, op.spanName, op.spanKind)
 	}
-
 	br, err := conn.SendBatch(ctx, dbBatch)
 	if err != nil {
 		return err
+	}
+	for _, op := range ops {
+		var id int64
+		if err := br.QueryRow().Scan(&id); err != nil {
+			return err
+		}
+		batch[op] = id
 	}
 	if err = br.Close(); err != nil {
 		return err
 	}
 	return nil
+}
+func (batch OperationBatch) GetID(serviceName, spanName, spanKind string) (pgtype.Int8, error) {
+	id, ok := batch[Operation{serviceName, spanName, spanKind}]
+	if id == 0 || !ok {
+		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("operation id not found: %s %s %s", serviceName, spanName, spanKind)
+	}
+	return pgtype.Int8{Int: id, Status: pgtype.Present}, nil
 }
 
 type Tag struct {
