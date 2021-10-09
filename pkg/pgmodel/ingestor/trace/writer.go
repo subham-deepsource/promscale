@@ -1,4 +1,4 @@
-package ingestor
+package trace
 
 import (
 	"context"
@@ -12,6 +12,19 @@ import (
 	"github.com/timescale/promscale/pkg/pgmodel/common/schema"
 	"github.com/timescale/promscale/pkg/pgxconn"
 	"go.opentelemetry.io/collector/model/pdata"
+)
+
+type TagType uint
+
+const (
+	SpanTagType TagType = 1 << iota
+	ResourceTagType
+	EventTagType
+	LinkTagType
+)
+const (
+	missingServiceName = "OTLPResourceNoServiceName"
+	serviceNameTagKey  = "service.name"
 )
 
 const (
@@ -30,7 +43,7 @@ const (
 		ON CONFLICT DO NOTHING`  // Most cases conflict only happens on retries, safe to ignore duplicate data.
 )
 
-type traceWriter interface {
+type Writer interface {
 	InsertTraces(ctx context.Context, traces pdata.Traces) error
 }
 
@@ -38,7 +51,7 @@ type traceWriterImpl struct {
 	conn pgxconn.PgxConn
 }
 
-func newTraceWriter(conn pgxconn.PgxConn) *traceWriterImpl {
+func NewWriter(conn pgxconn.PgxConn) *traceWriterImpl {
 	return &traceWriterImpl{
 		conn: conn,
 	}
