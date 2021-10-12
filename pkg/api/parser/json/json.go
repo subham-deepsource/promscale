@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 
 	"github.com/timescale/promscale/pkg/prompb"
 )
@@ -48,6 +49,12 @@ func generateProtoLabels(ll map[string]string) []prompb.Label {
 	for name, value := range ll {
 		result = append(result, prompb.Label{Name: name, Value: value})
 	}
+
+	comparator := func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	}
+
+	sort.Slice(result, comparator)
 	return result
 }
 
